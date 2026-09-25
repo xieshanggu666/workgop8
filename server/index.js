@@ -121,6 +121,218 @@ function settleLoans(cash, day) {
   return { cash, overdueHits, overdueIds }
 }
 
+// ---------------- 游客投诉与服务补救 ----------------
+const HOUR_TICKS = 1                              // 每 1 tick = 1 游戏小时
+const SEVERITY_HOURS = { 1: 4, 2: 3, 3: 2 }      // 各严重等级限时处置小时数
+const COMPLAINT_SPAWN_RATE = 0.16                 // 每 tick 自发投诉基础概率
+const COMPLAINT_SPAWN_RATE_PROTEST = 0.5          // 「排队投诉潮」期间概率
+const RECOVERY_TICKS = 8                          // 服务补救回流持续 tick 数
+
+const CHANNEL_META = {
+  '现场': { icon: '🎫' }, '热线': { icon: '📞' }, '网络点评': { icon: '💻' }, '社媒': { icon: '📱' }
+}
+// 投诉类别：匹配岗位 + 严重度权重 + 图标
+const CATEGORY_META = {
+  queue:   { icon: '⏳', label: '排队拥挤', role: '保安', weights: [0.6, 0.35, 0.05] },
+  ride:    { icon: '🎢', label: '设施体验', role: '维修', weights: [0.45, 0.4, 0.15] },
+  hygiene: { icon: '🧹', label: '卫生清洁', role: '保洁', weights: [0.55, 0.35, 0.1] },
+  food:    { icon: '🍔', label: '餐饮商品', role: '保洁', weights: [0.55, 0.35, 0.1] },
+  service: { icon: '🙋', label: '服务态度', role: '保安', weights: [0.6, 0.32, 0.08] },
+  price:   { icon: '💴', label: '价格争议', role: '保安', weights: [0.65, 0.3, 0.05] },
+  safety:  { icon: '🚨', label: '安全隐患', role: '维修', weights: [0.15, 0.45, 0.4] }
+}
+
+// 补偿方案库：rep = 声誉修复值 / buff = 回流势能；amount 为 0 时按票价动态折算
+const COMP_PLANS = [
+  { type: '致歉', icon: '🙇', amount: 0, rep: 1, buff: 0, minSeverity: 0 },
+  { type: '免票券', icon: '🎟️', amount: 0, dynamic: 'ticket', rep: 3, buff: 2, minSeverity: 0 },
+  { type: '代金券', icon: '🧧', amount: 50, rep: 4, buff: 3, minSeverity: 1 },
+  { type: '礼品套餐', icon: '🎁', amount: 120, rep: 7, buff: 5, minSeverity: 2 },
+  { type: '尊享升级', icon: '👑', amount: 300, rep: 11, buff: 8, minSeverity: 2 },
+  { type: '现金退款', icon: '💵', amount: 200, rep: 9, buff: 4, minSeverity: 1 }
+]
+
+const openComplaints = () => db.prepare("SELECT * FROM complaints WHERE status IN ('pending','processing') ORDER BY id").all()
+const complaintLogs = (cid) => db.prepare('SELECT * FROM complaint_logs WHERE complaint_id=? ORDER BY id').all(cid)
+
+function staffKind(role) {
+  if (role === '保洁') return '保洁'
+  if (role === '维修') return '维修'
+  return '保安'  // 保安/安保 等统一为秩序岗
+}
+
+function addComplaintLog(cid, tick, day, hour, action, actor, detail) {
+  db.prepare('INSERT INTO complaint_logs(complaint_id,tick,day,hour,action,actor,detail) VALUES(?,?,?,?,?,?,?)')
+    .run(cid, tick, day, hour, action, actor || '', detail || '')
+}
+
+// 按严重度权重随机选择 1/2/3
+function rollSeverity(weights) {
+  const r = Math.random()
+  if (r < weights[0]) return 1
+  if (r < weights[0] + weights[1]) return 2
+  return 3
+}
+
+function nextComplaintCode() {
+  const n = db.prepare('SELECT COUNT(*) n FROM complaints').get().n
+  return 'TS-' + String(n + 1).padStart(4, '0')
+}
+
+// 生成一条投诉；eventId 用于关联突发事件（如投诉潮）
+function createComplaint({ day, hour, tick, source = 'guest', channel, category, title, content, severity, zoneId = null, rideId = null, eventId = null }) {
+  const nowTick = tick ?? state.tick()
+  const r = db.prepare(`INSERT INTO complaints(code,tick,day,hour,source,channel,category,title,content,severity,status,zone_id,ride_id,due_tick,event_id,created_ts)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(nextComplaintCode(), nowTick, day, hour, source, channel, category, title, content, severity, 'pending', zoneId, rideId, nowTick + SEVERITY_HOURS[severity], eventId, new Date().toISOString())
+  const id = Number(r.lastInsertRowid)
+  addComplaintLog(id, nowTick, day, hour, 'create', source === 'desk' ? '服务台' : '游客', `${channel}收到投诉：${title}`)
+  return id
+}
+
+// 投诉池：weight 为自发概率权重
+const COMPLAINT_POOL = [
+  { category: 'queue', title: '热门项目排队过久', content: '游客反映热门设施排队时间过长，现场出现焦躁情绪。', channel: '现场', weight: 22,
+    pickTarget: () => {
+      const ops = operatingRides()
+      const r = ops[Math.floor(Math.random() * ops.length)]
+      return { rideId: r?.id, zoneId: r?.zone_id }
+    } },
+  { category: 'ride', title: '设施运行体验不佳', content: '游客投诉设施颠簸感强、运行时间缩水，与宣传不符。', channel: '热线', weight: 12,
+    pickTarget: () => { const ops = operatingRides(); const r = ops[Math.floor(Math.random() * ops.length)]; return { rideId: r?.id, zoneId: r?.zone_id } } },
+  { category: 'hygiene', title: '区域卫生不达标', content: '游客反映地面有污渍、垃圾桶满溢，影响游览心情。', channel: '现场', weight: 16,
+    pickTarget: () => { const zs = allZones().filter(z => z.open); const z = zs[Math.floor(Math.random() * zs.length)]; return { zoneId: z?.id } } },
+  { category: 'food', title: '餐饮出品引发不满', content: '游客反映餐品份量小、等待久，部分商品性价比低。', channel: '网络点评', weight: 14,
+    pickTarget: () => { const vs = allVendors(); const v = vs[Math.floor(Math.random() * vs.length)]; return { zoneId: v?.zone_id } } },
+  { category: 'service', title: '员工服务态度投诉', content: '游客反映咨询指引时工作人员回应冷淡、指引不清。', channel: '热线', weight: 12, pickTarget: () => ({}) },
+  { category: 'price', title: '园内定价争议', content: '游客在点评平台吐槽门票与园内消费偏高，体验与价格不匹配。', channel: '网络点评', weight: 10, pickTarget: () => ({}) },
+  { category: 'safety', title: '安全隐患反映', content: '游客发现区域内护栏松动/地面湿滑，担心发生意外。', channel: '现场', weight: 6,
+    pickTarget: () => { const zs = allZones().filter(z => z.open); const z = zs[Math.floor(Math.random() * zs.length)]; return { zoneId: z?.id } } }
+]
+
+function maybeSpawnComplaint(day, hour, tick) {
+  const protest = allEvents.actives().some(e => e.type === 'protest')
+  const rate = protest ? COMPLAINT_SPAWN_RATE_PROTEST : COMPLAINT_SPAWN_RATE
+  // 闭园时段投诉减半
+  const chance = (hour < OPEN_HOUR + HOURS_PER_DAY - 1 ? rate : rate * 0.5)
+  if (Math.random() > chance) return
+  const totalW = COMPLAINT_POOL.reduce((s, p) => s + p.weight, 0)
+  let roll = Math.random() * totalW, pool = COMPLAINT_POOL[0]
+  for (const p of COMPLAINT_POOL) { roll -= p.weight; if (roll <= 0) { pool = p; break } }
+  const meta = CATEGORY_META[pool.category]
+  // 卫生差/队列长会抬升严重投诉概率
+  const target = pool.pickTarget ? pool.pickTarget() : {}
+  const weights = [...meta.weights]
+  if (pool.category === 'hygiene' && target.zoneId) {
+    const z = allZones().find(x => x.id === target.zoneId)
+    if (z && z.cleanliness < 40) { weights[0] -= 0.3; weights[1] += 0.2; weights[2] += 0.1 }
+  }
+  if (pool.category === 'queue' && target.rideId) {
+    const r = allRides().find(x => x.id === target.rideId)
+    if (r && r.queue > r.capacity * 4) { weights[0] -= 0.2; weights[1] += 0.15; weights[2] += 0.05 }
+  }
+  // 社媒渠道由低概率事件触发，传播力更强
+  let channel = pool.channel
+  if (Math.random() < 0.12) channel = '社媒'
+  createComplaint({
+    day, hour, tick, source: 'guest', channel,
+    category: pool.category, title: pool.title, content: pool.content,
+    severity: rollSeverity(weights.map(w => Math.max(0, w))),
+    zoneId: target.zoneId ?? null, rideId: target.rideId ?? null
+  })
+}
+
+// 限时处置：超时升级 / 升级到顶后超时流失
+function processComplaintDeadlines(day, hour, tick) {
+  let repShift = 0
+  for (const c of openComplaints()) {
+    if (tick < c.due_tick) continue
+    if (c.severity < 3) {
+      // 自动升级：严重度 +1，倒计时重置
+      const sev = c.severity + 1
+      db.prepare('UPDATE complaints SET severity=?, escalated=1, escalations=escalations+1, due_tick=? WHERE id=?')
+        .run(sev, tick + SEVERITY_HOURS[sev], c.id)
+      addComplaintLog(c.id, tick, day, hour, 'auto_escalate', '系统', `限时内未处置完毕，投诉自动升级为「${sev === 2 ? '严重' : '紧急'}」，倒计时 ${SEVERITY_HOURS[sev]} 小时`)
+      if (sev === 3) {
+        // 紧急投诉进入舆情事件
+        const er = db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+          .run(tick, day, 'complaint', `舆情发酵：${c.title}`, `投诉单 ${c.code} 已升级为紧急且仍未解决，事件在游客间扩散，声誉持续承压，请立即处置。`, -3, 'active')
+        db.prepare('UPDATE complaints SET event_id=? WHERE id=?').run(Number(er.lastInsertRowid), c.id)
+        repShift -= 2
+      }
+    } else {
+      // 紧急超时未结：游客流失
+      closeComplaint(c, { resolution: 'lost', reason: '限时处置失败，游客未获回应并流失，投诉关闭。' }, { day, hour, tick })
+      repShift -= 5
+      addComplaintLog(c.id, tick, day, hour, 'timeout_close', '系统', '紧急投诉限时内仍未解决，按流失结案，声誉受损。')
+    }
+  }
+  return repShift
+}
+
+// 结案核心：仅写库；声誉/回流由调用方按返回值应用
+function closeComplaint(c, { resolution, compType = '', compAmount = 0, reply = '', staffId = null, reason = '' }, ctx) {
+  const day = ctx.day, hour = ctx.hour, tick = ctx.tick
+  let goodwill = 0, buffGain = 0
+  if (resolution === 'lost') {
+    goodwill = -5
+  } else {
+    const plan = COMP_PLANS.find(p => p.type === compType)
+    goodwill = (plan?.rep || 0)
+    buffGain = (plan?.buff || 0)
+  }
+  db.prepare(`UPDATE complaints SET status='resolved', resolution=?, comp_type=?, comp_amount=?, goodwill=?, buff_gain=?, reply=?,
+              closed_tick=?, closed_day=? WHERE id=?`)
+    .run(resolution, compType, compAmount, goodwill, buffGain, reply || reason, tick, day, c.id)
+  addComplaintLog(c.id, tick, day, hour, resolution === 'lost' ? 'timeout_close' : 'resolve',
+    staffId ? `员工#${staffId}` : '管理层',
+    resolution === 'lost'
+      ? (reason || '游客流失')
+      : `以「${compType}」结案${compAmount ? `，补偿成本 ¥${compAmount}` : ''}：${resolution === 'satisfied' ? '游客满意' : '游客勉强接受'}`)
+  // 联动的舆情事件同步了结
+  if (c.event_id) {
+    const fb = resolution === 'lost' ? '投诉未获处置，舆情负面影响固化。' : '投诉已完成服务补救，舆情平息。'
+    db.prepare("UPDATE events SET status='resolved', feedback=? WHERE id=?").run(fb, c.event_id)
+  }
+  return { goodwill, buffGain }
+}
+
+// 预估结案质量（派单/结案界面展示，与后端实际算法一致）
+function estimateResolution(c, staff) {
+  const cat = CATEGORY_META[c.category]
+  let q = 0.45
+  if (staff) {
+    q += 0.12
+    if (staffKind(staff.role) === cat.role) q += 0.18
+    q += (staff.skill - 1) * 0.05
+    q += (staff.morale - 50) / 200
+    const load = openComplaints().filter(x => x.assigned_staff_id === staff.id).length
+    q -= load * 0.04
+  }
+  q -= (c.severity - 1) * 0.1
+  const hours = Math.max(0, state.tick() - (c.assigned_tick || c.tick))
+  const limit = SEVERITY_HOURS[c.severity]
+  const onTime = state.tick() + Math.max(0, limit - hours) >= c.due_tick
+  return Math.max(0.05, Math.min(0.98, q))
+}
+
+// 服务补救回流：衰减并给出客流/满意度因子
+function decayRecovery(tick) {
+  let until = num(getSetting('recovery_until'), 0)
+  let gain = num(getSetting('recovery_gain'), 0)
+  if (until > tick) {
+    // 每次衰减 1/3 的当前势能，缓慢回流
+    gain = Math.max(0, gain * 0.7)
+    if (gain < 0.15) { until = 0; gain = 0 }
+    setSetting('recovery_gain', Math.round(gain * 100) / 100)
+    setSetting('recovery_until', until)
+  } else if (gain) {
+    gain = 0
+    setSetting('recovery_gain', 0)
+  }
+  return gain
+}
+
 // ---------------- 游戏主循环 ----------------
 function tick() {
   let day = state.day()

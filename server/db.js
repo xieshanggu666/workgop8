@@ -119,6 +119,49 @@ CREATE TABLE IF NOT EXISTS events (
   feedback TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS complaints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- 投诉单号 TS-0001
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  source TEXT NOT NULL DEFAULT 'guest',   -- guest 游客自发 / desk 服务台登记
+  channel TEXT NOT NULL DEFAULT '现场',    -- 现场/热线/网络点评/社媒
+  category TEXT NOT NULL DEFAULT 'service', -- queue/ride/hygiene/food/service/price/safety
+  title TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  severity INTEGER NOT NULL DEFAULT 1,     -- 1 一般 / 2 严重 / 3 紧急
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending/processing/resolved/closed(closed=超时流失)
+  zone_id INTEGER,
+  ride_id INTEGER,
+  assigned_staff_id INTEGER,
+  assigned_tick INTEGER,
+  due_tick INTEGER NOT NULL DEFAULT 0,     -- 限时处置截止时刻(tick)
+  escalated INTEGER NOT NULL DEFAULT 0,    -- 是否被升级/督办过
+  escalations INTEGER NOT NULL DEFAULT 0, -- 升级次数
+  resolution TEXT NOT NULL DEFAULT '',     -- satisfied/accepted/lost
+  comp_type TEXT NOT NULL DEFAULT '',      -- 致歉/免票券/代金券/礼品套餐/尊享升级/退款
+  comp_amount INTEGER NOT NULL DEFAULT 0, -- 补偿成本(现金等价)
+  goodwill REAL NOT NULL DEFAULT 0,        -- 结案带来的声誉净值
+  buff_gain REAL NOT NULL DEFAULT 0,       -- 结案注入的服务补救回流势能
+  reply TEXT NOT NULL DEFAULT '',          -- 结案回复
+  event_id INTEGER,                        -- 升级到紧急时关联的舆情事件
+  closed_tick INTEGER,
+  closed_day INTEGER,
+  created_ts TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS complaint_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  complaint_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,                    -- create/assign/escalate/auto_escalate/resolve/timeout_close
+  actor TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -206,6 +249,17 @@ function seed() {
     f.run(0, 0, '纪念品', 15000, '昨日纪念品收入')
     f.run(0, 0, '工资', -26000, '昨日工资支出')
     f.run(0, 0, '维护', -9000, '昨日设施维护')
+  }
+
+  // 初始待处理投诉（限时处置体验）
+  const pc = db.prepare('SELECT COUNT(*) n FROM complaints').get().n
+  if (pc === 0) {
+    db.prepare(`INSERT INTO complaints(code,tick,day,hour,source,channel,category,title,content,severity,status,zone_id,due_tick,created_ts)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run('TS-0001', 0, 1, 9, 'guest', '现场', 'queue', '热门项目排队过久',
+        '游客反映「极速飞车」排队超过 40 分钟，部分游客情绪激动，要求给出说法。', 2, 'pending', 2, 3, nf)
+    db.prepare('INSERT INTO complaint_logs(complaint_id,tick,day,hour,action,actor,detail) VALUES(?,?,?,?,?,?,?)')
+      .run(1, 0, 1, 9, 'create', '游客', '现场收到游客投诉：热门项目排队过久')
   }
 }
 seed()
