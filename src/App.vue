@@ -8,6 +8,7 @@ import VendorsView from '@/components/VendorsView.vue'
 import StaffView from '@/components/StaffView.vue'
 import TicketView from '@/components/TicketView.vue'
 import EventsView from '@/components/EventsView.vue'
+import ComplaintsView from '@/components/ComplaintsView.vue'
 import ReportsView from '@/components/ReportsView.vue'
 
 const store = useParkStore()
@@ -21,6 +22,7 @@ const navs = [
   { k: 'staff', icon: '👷', label: '员工管理' },
   { k: 'ticket', icon: '🎫', label: '票务定价' },
   { k: 'events', icon: '🎆', label: '活动事件' },
+  { k: 'complaints', icon: '🗂️', label: '投诉补救' },
   { k: 'reports', icon: '📈', label: '经营报表' }
 ]
 
@@ -55,6 +57,7 @@ onMounted(store.refresh)
         <div class="la">
           <h2>{{ navs.find(n => n.k === view)?.label }}</h2>
           <span class="halo" v-if="store.activeEvents.length">{{ store.activeEvents.length }} 个待处理事件</span>
+          <span class="halo red" v-if="store.complaintStats.open">{{ store.complaintStats.open }} 条投诉待处置</span>
         </div>
         <div class="stats">
           <div class="pill">💰 <b :class="store.data && store.data.cash < 0 ? 'neg money' : 'money'">{{ store.data?.cash?.toLocaleString() ?? 0 }}</b></div>
@@ -72,6 +75,7 @@ onMounted(store.refresh)
         <StaffView v-else-if="view === 'staff'" />
         <TicketView v-else-if="view === 'ticket'" />
         <EventsView v-else-if="view === 'events'" />
+        <ComplaintsView v-else-if="view === 'complaints'" />
         <ReportsView v-else />
       </section>
     </main>
@@ -103,6 +107,7 @@ main { flex: 1; min-width: 0; }
 .topbar { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; border-bottom: 1px solid var(--border); background: rgba(15,20,38,.6); position: sticky; top:0; z-index: 20; backdrop-filter: blur(6px); }
 .topbar .la { display: flex; align-items: center; gap: 12px; }
 .halo { font-size: 12px; background: rgba(255,209,102,.2); color: var(--accent2); border: 1px solid rgba(255,209,102,.4); padding: 2px 10px; border-radius: 20px; }
+.halo.red { background: rgba(255,107,107,.18); color: var(--red); border-color: rgba(255,107,107,.45); }
 .stats { display: flex; gap: 12px; flex-wrap: wrap; }
 .pill { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); padding: 6px 12px; border-radius: 20px; }
 .pill b { color: var(--text); margin-left: 4px; }

@@ -26,7 +26,8 @@ const state = {
   cash: () => num(getSetting('cash'), 0),
   reputation: () => num(getSetting('reputation'), 70),
   ticket: () => num(getSetting('ticket'), 120),
-  guestBase: () => num(getSetting('guestBase'), 600)
+  guestBase: () => num(getSetting('guestBase'), 600),
+  wordOfMouth: () => num(getSetting('wordOfMouth'), 0)   // 投诉补救口碑 -10 ~ +10
 }
 
 const allZones = () => db.prepare('SELECT * FROM zones ORDER BY id').all()
@@ -121,6 +122,279 @@ function settleLoans(cash, day) {
   return { cash, overdueHits, overdueIds }
 }
 
+// ---------------- 游客投诉与服务补救 ----------------
+// 投诉处置时限（游戏小时）：一般 8h / 严重 5h / 紧急 3h；升级后按新等级重置时限
+const SEV_SLA = { 1: 8, 2: 5, 3: 3 }
+const SEV_NAMES = { 1: '一般', 2: '严重', 3: '紧急' }
+const OPEN_COMPLAINT_STATUSES = ['open', 'processing', 'ready']
+
+const COMPLAINT_CATS = {
+  queue:    { name: '排队秩序', icon: '⏳', roles: ['保安', '安保'] },
+  hygiene:  { name: '环境卫生', icon: '🧹', roles: ['保洁'] },
+  facility: { name: '设施故障', icon: '🛠️', roles: ['维修'] },
+  safety:   { name: '安全隐患', icon: '🚨', roles: ['保安', '安保'] },
+  food:     { name: '餐饮质量', icon: '🍔', roles: ['保洁'] },
+  service:  { name: '服务态度', icon: '💁', roles: [] },      // 无专属岗位，任何员工均可受理
+  pricing:  { name: '价格争议', icon: '💰', roles: [] },
+  missing:  { name: '物品遗失', icon: '🎒', roles: ['保安', '安保'] }
+}
+
+const COMPLAINT_TPL = {
+  queue: ['排队两小时游玩五分钟，队伍完全没人疏导！', '快速通道和普通队混在一起，秩序混乱。', '大热天排队区没有遮阳和饮水，太遭罪了。'],
+  hygiene: ['卫生间又脏又臭，垃圾桶都溢出来了。', '休息区长椅上全是食物残渣，没人打扫。', '地面黏糊糊的，孩子差点滑倒。'],
+  facility: ['设施运行时异响很大，坐着心里发慌。', '排到了却临时停运，白等一个多小时。', '安全压杠松动，工作人员也不仔细检查。'],
+  safety: ['人流挤在一起没有保安疏导，感觉要出踩踏事故。', '护栏间隙太大，小孩能钻过去，太危险。', '夜间照明不足，台阶处差点摔倒。'],
+  food: ['餐食是凉的，而且吃出异物，要求给个说法！', '饮料淡得像白水，价格还贵得离谱。', '吃完园内餐食后肚子不舒服。'],
+  service: ['工作人员态度恶劣，问个路都不耐烦。', '检票员当众呵斥游客，体验极差。', '咨询台没人值守，等了半天没人理。'],
+  pricing: ['园内物价是外面三倍，标价也不醒目。', '买了联票却多项设施另收费，涉嫌误导。', '纪念品结账价格和标签不一致。'],
+  missing: ['孩子在园区走失半小时，广播寻人不及时。', '随身包在寄存处丢失，园方互相推诿。', '手机落在设施上，工作人员不配合查找。']
+}
+
+// 补偿方案：score 决定游客满意度，ticket 成本随当日票价浮动
+const COMP_OPTIONS = {
+  apology:  { name: '真诚道歉', cost: 0,    score: 6 },
+  ticket:   { name: '赠门票',   cost: 0,    score: 14 },
+  fastpass: { name: '快速通行券', cost: 150, score: 20 },
+  voucher:  { name: '消费券',   cost: 300,  score: 26 },
+  cash:     { name: '现金补偿', cost: 600,  score: 34 }
+}
+
+function logComplaint(cid, action, note, staffId = null) {
+  db.prepare('INSERT INTO complaint_logs(complaint_id,tick,day,hour,action,note,staff_id) VALUES(?,?,?,?,?,?,?)')
+    .run(cid, state.tick(), state.day(), state.hour(), action, note || '', staffId)
+}
+
+function createComplaint({ category, severity, title, content, target, source }) {
+  const cat = COMPLAINT_CATS[category] ? category : 'service'
+  const sev = Math.max(1, Math.min(3, Math.round(severity || 1)))
+  const r = db.prepare(`INSERT INTO complaints(code,tick,day,category,severity,title,content,target_type,target_id,status,deadline_tick,source)
+                        VALUES(?,?,?,?,?,?,?,?,?,'open',?,?)`)
+    .run('', state.tick(), state.day(), cat, sev, title, content || '', target?.type || '', target?.id ?? null, state.tick() + SEV_SLA[sev], source || 'guest')
+  const id = Number(r.lastInsertRowid)
+  const code = 'TS' + String(id).padStart(4, '0')
+  db.prepare('UPDATE complaints SET code=? WHERE id=?').run(code, id)
+  logComplaint(id, 'submit', source === 'manual' ? '前台登记游客反馈' : '游客通过客服热线提交投诉')
+  return { id, code }
+}
+
+function pickComplaintTarget(cat, rides, vendors, zones) {
+  const none = { type: '', id: null, name: '' }
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)]
+  const openZoneIds = new Set(zones.filter(z => z.unlocked && z.open).map(z => z.id))
+  if (cat === 'queue' || cat === 'facility') {
+    const inPark = rides.filter(r => openZoneIds.has(r.zone_id))
+    const pool = cat === 'queue'
+      ? inPark.filter(r => r.queue > r.capacity * 2)
+      : inPark.filter(r => r.health < 60)
+    const r = pick(pool.length ? pool : inPark)
+    return r ? { type: 'ride', id: r.id, name: r.name } : none
+  }
+  if (cat === 'hygiene') {
+    const openZones = zones.filter(z => z.unlocked && z.open)
+    const dirty = openZones.filter(z => z.cleanliness < 60)
+    const z = pick(dirty.length ? dirty : openZones)
+    return z ? { type: 'zone', id: z.id, name: z.name } : none
+  }
+  if (cat === 'food' || cat === 'pricing') {
+    const inPark = vendors.filter(v => openZoneIds.has(v.zone_id))
+    const pool = cat === 'food' ? inPark.filter(v => v.type !== '纪念品') : inPark
+    const v = pick(pool.length ? pool : inPark)
+    return v ? { type: 'vendor', id: v.id, name: v.name } : none
+  }
+  return none
+}
+
+// 每小时根据园区运营状况随机生成投诉（游客反馈入口）
+function maybeSpawnComplaints(entering, satisfaction) {
+  const openCount = db.prepare("SELECT COUNT(*) n FROM complaints WHERE status IN ('open','processing','ready')").get().n
+  if (openCount >= 15) return
+  const rides = allRides()
+  const ops = operatingRides()
+  const zones = allZones()
+  const longQueue = ops.filter(r => r.queue > r.capacity * 4).length
+  const broken = rides.filter(r => r.status === 'maintenance').length
+  const avgClean = zones.length ? zones.reduce((s, z) => s + z.cleanliness, 0) / zones.length : 70
+  const protest = allEvents.actives().some(e => e.type === 'protest')
+  const staffCount = allStaff().filter(s => s.active).length
+  const chance = 0.10
+    + longQueue * 0.05
+    + broken * 0.05
+    + Math.max(0, 60 - avgClean) * 0.004
+    + Math.min(0.12, entering / 6000)
+    + (protest ? 0.18 : 0)
+    + (staffCount < 3 ? 0.06 : 0)
+    + (satisfaction < 55 ? 0.06 : 0)
+  if (Math.random() >= chance) return
+
+  // 按当前园区状况加权选择投诉类别
+  const weights = [
+    ['queue', 1 + longQueue * 2.5],
+    ['hygiene', 1 + Math.max(0, 60 - avgClean) / 6],
+    ['facility', 1 + broken * 2.5],
+    ['safety', protest ? 3 : 0.6],
+    ['food', 1],
+    ['service', staffCount < 4 ? 2.2 : 1],
+    ['pricing', state.ticket() > 160 ? 2 : 0.8],
+    ['missing', 0.5]
+  ]
+  const totalW = weights.reduce((s, w) => s + w[1], 0)
+  let roll = Math.random() * totalW, category = 'service'
+  for (const [k, w] of weights) { roll -= w; if (roll <= 0) { category = k; break } }
+
+  // 严重度：安全类更可能升级
+  const sr = Math.random()
+  const severity = category === 'safety'
+    ? (sr < 0.18 ? 3 : sr < 0.55 ? 2 : 1)
+    : (sr < 0.07 ? 3 : sr < 0.30 ? 2 : 1)
+
+  const target = pickComplaintTarget(category, rides, allVendors(), zones)
+  const tpls = COMPLAINT_TPL[category]
+  const content = tpls[Math.floor(Math.random() * tpls.length)]
+  const title = `${COMPLAINT_CATS[category].name}投诉 · ${target.name || '园区整体'}`
+  createComplaint({ category, severity, title, content, target, source: 'guest' })
+}
+
+// 紧急投诉超时未处置：游客公开差评，声誉/口碑受损
+function timeoutCloseComplaint(c) {
+  db.prepare(`UPDATE complaints SET status='closed_timeout', close_reason='限时内未处置，游客愤而离场并公开差评', closed_tick=?, closed_day=? WHERE id=?`)
+    .run(state.tick(), state.day(), c.id)
+  logComplaint(c.id, 'timeout', '紧急投诉超时未处置，游客公开差评')
+  const wom = Math.max(-10, state.wordOfMouth() - 2)
+  setSetting('wordOfMouth', Math.round(wom * 10) / 10)
+  db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+    .run(state.tick(), state.day(), 'complaint', '投诉超时引发差评', `「${c.title}」未在限时内处置，游客在社交平台公开差评，口碑受损。`, -2, 'active')
+  return 6
+}
+
+// 投诉处置主循环：受理中推进进度；超时自动升级或结案；待确认补偿久置自动致歉结案。返回本时段声誉扣分
+function processComplaints() {
+  const tick = state.tick()
+  let repPenalty = 0
+  const open = db.prepare("SELECT * FROM complaints WHERE status IN ('open','processing','ready')").all()
+  const upd = db.prepare('UPDATE complaints SET status=?, progress=?, deadline_tick=?, severity=?, escalated=?, escalations=?, resolved_tick=? WHERE id=?')
+  for (const c of open) {
+    if (c.status === 'ready') {
+      if (tick - (c.resolved_tick || c.tick) >= 6) {
+        doResolveComplaint(c.id, 'apology', true)
+      }
+      continue
+    }
+    if (tick > c.deadline_tick) {
+      if (c.severity < 3) {
+        // 限时未处置：自动升级一级，时限重置，声誉受损
+        const sev = c.severity + 1
+        upd.run(c.status, c.progress, tick + SEV_SLA[sev], sev, 1, c.escalations + 1, c.resolved_tick, c.id)
+        logComplaint(c.id, 'auto_escalate', `超过限时未处置，自动升级为「${SEV_NAMES[sev]}」`)
+        repPenalty += sev * 1.2
+      } else {
+        repPenalty += timeoutCloseComplaint(c)
+      }
+      continue
+    }
+    if (c.status === 'processing') {
+      const st = c.assignee_id ? db.prepare('SELECT * FROM staff WHERE id=?').get(c.assignee_id) : null
+      if (!st || !st.active) {
+        upd.run('open', c.progress, c.deadline_tick, c.severity, c.escalated, c.escalations, c.resolved_tick, c.id)
+        logComplaint(c.id, 'unassign', '受理员工离岗，投诉退回待受理')
+        continue
+      }
+      const meta = COMPLAINT_CATS[c.category] || COMPLAINT_CATS.service
+      const match = !meta.roles.length || meta.roles.includes(st.role)
+      const rate = (8 + st.skill * 5 + st.morale / 12) * (match ? 1.5 : 1)
+      const progress = c.progress + rate
+      if (progress >= 100) {
+        upd.run('ready', 100, c.deadline_tick, c.severity, c.escalated, c.escalations, tick, c.id)
+        logComplaint(c.id, 'ready', `${st.name} 完成现场处置，等待补偿确认`, st.id)
+      } else {
+        upd.run('processing', Math.round(progress * 10) / 10, c.deadline_tick, c.severity, c.escalated, c.escalations, c.resolved_tick, c.id)
+      }
+    }
+  }
+  return repPenalty
+}
+
+// 补偿结案：依据处置质量、补偿档次、等待时长与升级记录计算游客评价，回流声誉/口碑/员工满意度
+function doResolveComplaint(id, compKey, auto = false) {
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(id)
+  if (!c) return { ok: false, msg: '投诉不存在' }
+  if (c.status !== 'ready') return { ok: false, msg: '需先指派员工完成现场处置' }
+  const opt = COMP_OPTIONS[compKey] || COMP_OPTIONS.apology
+  const cost = compKey === 'ticket' ? state.ticket() : opt.cost
+  let cash = state.cash()
+  if (cash < cost) return { ok: false, msg: `资金不足，该补偿方案需 ¥${cost.toLocaleString()}` }
+
+  const st = c.assignee_id ? db.prepare('SELECT * FROM staff WHERE id=?').get(c.assignee_id) : null
+  const meta = COMPLAINT_CATS[c.category] || COMPLAINT_CATS.service
+  const match = st && (!meta.roles.length || meta.roles.includes(st.role))
+  const quality = st ? Math.min(100, st.skill * 18 + st.morale * 0.4 + (match ? 15 : 0)) : 30
+  const waited = Math.max(0, state.tick() - c.tick)
+  let rating = 1.6 + quality / 30 + opt.score / 12 - (waited > 24 ? 0.6 : waited > 12 ? 0.3 : 0) - (c.escalated ? 0.3 : 0)
+  rating = Math.max(1, Math.min(5, Math.round(rating)))
+
+  cash -= cost
+  setSetting('cash', Math.round(cash))
+  const repGain = 1.2 + rating * 0.8 + c.severity * 0.4
+  setSetting('reputation', Math.round(Math.max(5, Math.min(100, state.reputation() + repGain)) * 10) / 10)
+  const wom = Math.max(-10, Math.min(10, state.wordOfMouth() + (rating - 3) * 0.8))
+  setSetting('wordOfMouth', Math.round(wom * 10) / 10)
+  if (st) db.prepare('UPDATE staff SET morale=? WHERE id=?').run(Math.max(20, Math.min(100, st.morale + (rating >= 4 ? 4 : rating === 3 ? 1 : -3))), st.id)
+  if (cost > 0) logFinance(state.day(), '补偿', -cost, `投诉 ${c.code}「${opt.name}」`)
+
+  db.prepare(`UPDATE complaints SET status='closed_resolved', compensation=?, comp_cost=?, rating=?, close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
+    .run(compKey, cost, rating, auto ? '超时未确认补偿，系统自动以真诚道歉结案' : '补偿方案确认，游客满意离园', state.tick(), state.day(), id)
+  logComplaint(id, 'resolve', `${auto ? '系统自动' : '确认'}补偿「${opt.name}」${cost ? `，支出 ¥${cost}` : ''}，游客评价 ${rating} 星`, st?.id ?? null)
+  return { ok: true, rating, cost }
+}
+
+// 不予补偿直接结案：游客不满，声誉与口碑受损
+function forceCloseComplaint(id) {
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(id)
+  if (!c || !OPEN_COMPLAINT_STATUSES.includes(c.status)) return { ok: false, msg: '投诉不存在或已结案' }
+  db.prepare(`UPDATE complaints SET status='closed_force', close_reason='园方未予补偿，游客不满离去', closed_tick=?, closed_day=? WHERE id=?`)
+    .run(state.tick(), state.day(), id)
+  logComplaint(id, 'force', '园方未予补偿直接结案，游客不满')
+  setSetting('reputation', Math.round(Math.max(5, state.reputation() - (2 + c.severity)) * 10) / 10)
+  const wom = Math.max(-10, state.wordOfMouth() - 1)
+  setSetting('wordOfMouth', Math.round(wom * 10) / 10)
+  return { ok: true }
+}
+
+function enrichComplaints(rows) {
+  const tick = state.tick()
+  const rides = allRides(), vendors = allVendors(), zones = allZones()
+  return rows.map(c => {
+    const st = c.assignee_id ? db.prepare('SELECT id,name,role,skill,morale FROM staff WHERE id=?').get(c.assignee_id) : null
+    const target = c.target_type === 'ride' ? rides.find(r => r.id === c.target_id)
+      : c.target_type === 'vendor' ? vendors.find(v => v.id === c.target_id)
+      : c.target_type === 'zone' ? zones.find(z => z.id === c.target_id) : null
+    const meta = COMPLAINT_CATS[c.category] || COMPLAINT_CATS.service
+    const active = ['open', 'processing'].includes(c.status)
+    return {
+      ...c,
+      category_name: meta.name,
+      category_icon: meta.icon,
+      severity_name: SEV_NAMES[c.severity],
+      remain_ticks: active ? c.deadline_tick - tick : 0,
+      overdue: active && tick > c.deadline_tick,
+      assignee_name: st?.name || '',
+      assignee_role: st?.role || '',
+      role_match: st ? (!meta.roles.length || meta.roles.includes(st.role)) : false,
+      target_name: target?.name || ''
+    }
+  })
+}
+
+function complaintStats() {
+  const open = db.prepare("SELECT COUNT(*) n FROM complaints WHERE status IN ('open','processing','ready')").get().n
+  const overdue = db.prepare("SELECT COUNT(*) n FROM complaints WHERE status IN ('open','processing') AND deadline_tick < ?").get(state.tick()).n
+  const todayClosed = db.prepare('SELECT COUNT(*) n FROM complaints WHERE closed_day=?').get(state.day()).n
+  const resolved = db.prepare("SELECT COUNT(*) n FROM complaints WHERE status='closed_resolved'").get().n
+  const total = db.prepare('SELECT COUNT(*) n FROM complaints').get().n
+  const avgRating = db.prepare("SELECT AVG(rating) a FROM complaints WHERE status='closed_resolved' AND rating>0").get().a || 0
+  const compTotal = db.prepare("SELECT COALESCE(SUM(comp_cost),0) s FROM complaints WHERE status='closed_resolved'").get().s || 0
+  return { open, overdue, todayClosed, resolved, total, avgRating: Math.round(avgRating * 10) / 10, compTotal }
+}
+
 // ---------------- 游戏主循环 ----------------
 function tick() {
   let day = state.day()
@@ -161,8 +435,12 @@ function tick() {
   const priceFactor = Math.max(0.2, 2.0 - ticket / 100)     // 价越高人越少
   const repFactor = 0.4 + rep / 100
   const zoneFactor = 1
-  const entering = Math.round(base * retail * priceFactor * repFactor * zoneFactor * (0.85 + Math.random() * 0.3))
+  // 投诉补救口碑回流：每点口碑约影响 ±1.2% 客流
+  const complaintFactor = Math.max(0.7, 1 + state.wordOfMouth() * 0.012)
+  const entering = Math.round(base * retail * priceFactor * repFactor * zoneFactor * complaintFactor * (0.85 + Math.random() * 0.3))
   const satisfaction = computeSatisfaction()
+  // 游客反馈：运营状况驱动随机投诉
+  maybeSpawnComplaints(entering, satisfaction)
   const avgSpend = 40 + satisfaction / 5 + Math.random() * 15
   const spend = Math.round(entering * (avgSpend * 0.15 + ticket * 0.5)) // 门票为主的收入模型
 
@@ -243,9 +521,12 @@ function tick() {
     if (e.impact && e.status === 'active') eventRepShift += (e.impact > 0 ? 0.8 : -1.6)
   }
 
-  // 声誉演化：满意度+事件+预算健康度
+  // 投诉处置：推进受理进度，超时自动升级 / 公开差评，返回本时段声誉扣分
+  const complaintPenalty = processComplaints()
+
+  // 声誉演化：满意度+事件+预算健康度+超时投诉
   const budgetHealth = cash > 0 ? Math.min(1, cash / 200000) : -0.4
-  rep = Math.max(5, Math.min(100, rep + (satisfaction - 70) * 0.15 + budgetHealth * 2 + eventRepShift))
+  rep = Math.max(5, Math.min(100, rep + (satisfaction - 70) * 0.15 + budgetHealth * 2 + eventRepShift - complaintPenalty))
 
   // 贷款逾期：信用受损（本次日结新产生的逾期，每条 -1.5 声誉）
   if (overdueHits > 0) {
@@ -262,6 +543,10 @@ function tick() {
 
   db.prepare('INSERT INTO visitors(tick,day,hour,count,satisfaction,eat,total_spend) VALUES(?,?,?,?,?,?,?)')
     .run(tickCount, day, hour, entering, Math.round(satisfaction * 10) / 10, Math.round(avgSpend * 10) / 10, Math.round(spend * 10) / 10)
+
+  // 服务口碑自然回落，避免一次补偿永久加成
+  const womNow = state.wordOfMouth()
+  if (womNow !== 0) setSetting('wordOfMouth', Math.round(womNow * 0.98 * 100) / 100)
 
   setSetting('cash', Math.round(cash))
   setSetting('reputation', Math.round(rep * 10) / 10)
@@ -282,6 +567,10 @@ function computeSatisfaction() {
   sat += openRatio * 35
   const longQueue = ops.filter(r => r.queue > r.capacity * 4).length
   sat -= longQueue * 3
+  // 未结投诉持续拉低满意度（按严重度，上限 15），服务口碑小幅回流
+  const drag = db.prepare("SELECT COALESCE(SUM(severity),0) s FROM complaints WHERE status IN ('open','processing','ready')").get().s
+  sat -= Math.min(15, drag * 0.8)
+  sat += Math.max(-10, Math.min(10, state.wordOfMouth())) * 0.5
   sat += state.reputation() * 0.2
   return Math.max(10, Math.min(100, sat))
 }
@@ -357,6 +646,9 @@ app.get('/api/state', (req, res) => {
     vendors: allVendors(),
     staff: allStaff(),
     events: db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 40').all(),
+    complaints: enrichComplaints(db.prepare('SELECT * FROM complaints ORDER BY id DESC LIMIT 60').all()),
+    complaintStats: complaintStats(),
+    wordOfMouth: state.wordOfMouth(),
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -594,6 +886,77 @@ app.post('/api/events/:id/resolve', (req, res) => {
     setSetting('reputation', Math.max(5, Math.min(100, rep)))
   }
   res.json({ ok: true })
+})
+
+// ---- 游客投诉与服务补救 ----
+app.get('/api/complaints', (req, res) => {
+  const rows = db.prepare('SELECT * FROM complaints ORDER BY id DESC LIMIT 120').all()
+  res.json({ list: enrichComplaints(rows), stats: complaintStats() })
+})
+
+// 前台登记游客反馈（手动建单）
+app.post('/api/complaints', (req, res) => {
+  const b = req.body || {}
+  const category = COMPLAINT_CATS[b.category] ? b.category : 'service'
+  const severity = Math.max(1, Math.min(3, Math.round(num(b.severity, 1))))
+  const content = String(b.content || '').trim()
+  if (!content) return res.status(400).json({ ok: false, msg: '请填写游客反馈内容' })
+  if (content.length > 200) return res.status(400).json({ ok: false, msg: '反馈内容请控制在 200 字以内' })
+  let target = { type: '', id: null, name: '' }
+  if (b.target_type === 'ride') { const r = allRides().find(x => x.id === num(b.target_id)); if (r) target = { type: 'ride', id: r.id, name: r.name } }
+  else if (b.target_type === 'vendor') { const v = allVendors().find(x => x.id === num(b.target_id)); if (v) target = { type: 'vendor', id: v.id, name: v.name } }
+  else if (b.target_type === 'zone') { const z = allZones().find(x => x.id === num(b.target_id)); if (z) target = { type: 'zone', id: z.id, name: z.name } }
+  const title = `${COMPLAINT_CATS[category].name}投诉 · ${target.name || '园区整体'}`
+  const r = createComplaint({ category, severity, title, content, target, source: 'manual' })
+  res.json({ ok: true, ...r })
+})
+
+// 指派员工受理（员工处理：技能/满意度/岗位匹配决定处置速度与结案评价）
+app.post('/api/complaints/:id/assign', (req, res) => {
+  const id = num(req.params.id)
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(id)
+  if (!c || !OPEN_COMPLAINT_STATUSES.includes(c.status)) return res.status(400).json({ ok: false, msg: '投诉不存在或已结案' })
+  const st = db.prepare('SELECT * FROM staff WHERE id=? AND active=1').get(num(req.body?.staff_id))
+  if (!st) return res.status(400).json({ ok: false, msg: '员工不存在或已离岗' })
+  db.prepare("UPDATE complaints SET status='processing', assignee_id=? WHERE id=?").run(st.id, id)
+  logComplaint(id, 'assign', `指派 ${st.name}（${st.role}）受理`, st.id)
+  res.json({ ok: true })
+})
+
+// 升级投诉：严重度 +1，时限按新等级重置，需更高技能员工接手
+app.post('/api/complaints/:id/escalate', (req, res) => {
+  const id = num(req.params.id)
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(id)
+  if (!c || !OPEN_COMPLAINT_STATUSES.includes(c.status)) return res.status(400).json({ ok: false, msg: '投诉不存在或已结案' })
+  if (c.severity >= 3) return res.status(400).json({ ok: false, msg: '已是最高等级，无法继续升级' })
+  const sev = c.severity + 1
+  db.prepare('UPDATE complaints SET severity=?, escalated=1, escalations=escalations+1, deadline_tick=? WHERE id=?')
+    .run(sev, state.tick() + SEV_SLA[sev], id)
+  logComplaint(id, 'escalate', `管理层介入，投诉升级为「${SEV_NAMES[sev]}」，限时 ${SEV_SLA[sev]} 小时`)
+  res.json({ ok: true })
+})
+
+// 确认补偿方案并结案（补偿记录 + 声誉/口碑/员工满意度回流）
+app.post('/api/complaints/:id/resolve', (req, res) => {
+  const id = num(req.params.id)
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(id)
+  if (!c) return res.status(404).json({ ok: false, msg: '投诉不存在' })
+  if (c.status !== 'ready') return res.status(400).json({ ok: false, msg: '需先指派员工完成现场处置，才能确认补偿' })
+  const comp = COMP_OPTIONS[req.body?.compensation] ? req.body.compensation : 'apology'
+  res.json(doResolveComplaint(id, comp))
+})
+
+// 不予补偿直接结案：游客不满，扣减声誉与口碑
+app.post('/api/complaints/:id/close', (req, res) => {
+  res.json(forceCloseComplaint(num(req.params.id)))
+})
+
+// 单条投诉详情 + 处理时间线
+app.get('/api/complaints/:id', (req, res) => {
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(num(req.params.id))
+  if (!c) return res.status(404).json({ ok: false })
+  const logs = db.prepare('SELECT * FROM complaint_logs WHERE complaint_id=? ORDER BY id').all(c.id)
+  res.json({ complaint: enrichComplaints([c])[0], logs })
 })
 
 app.listen(PORT, () => console.log(`[PARK] API running at http://localhost:${PORT}`))

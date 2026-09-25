@@ -58,6 +58,12 @@ const repLabels = Array.from({ length: Math.min(store.visitors.length, 12) }, (_
       <div class="card stat"><span>🔄</span><b class="money">{{ (s.rev + s.exp).toLocaleString() }}</b><em>今日净利</em></div>
       <div class="card stat"><span>🎢</span><b>{{ s.ops }}/{{ s.total }}</b><em>运营设施</em></div>
       <div class="card stat"><span>🎆</span><b>{{ s.activeEvents }}</b><em>待处理事件</em></div>
+      <div class="card stat" :class="{ alert: store.complaintStats.overdue }">
+        <span>📮</span><b>{{ store.complaintStats.open }}</b><em>待处置投诉<span v-if="store.complaintStats.overdue">（{{ store.complaintStats.overdue }} 超时）</span></em>
+      </div>
+      <div class="card stat">
+        <span>💬</span><b :class="store.wordOfMouth > 0 ? 'money' : store.wordOfMouth < 0 ? 'money neg' : ''">{{ store.wordOfMouth > 0 ? '+' : '' }}{{ store.wordOfMouth }}</b><em>服务口碑</em>
+      </div>
     </div>
 
     <div class="row">
@@ -129,6 +135,8 @@ const repLabels = Array.from({ length: Math.min(store.visitors.length, 12) }, (_
 .stat span { font-size: 24px; }
 .stat b { font-size: 26px; }
 .stat em { font-style: normal; color: var(--muted); font-size: 13px; }
+.stat.alert { border-color: rgba(255,107,107,.55); }
+.stat.alert em span { color: var(--red); }
 .row { display: grid; grid-template-columns: 1.8fr 1fr; gap: 16px; }
 .row-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
 @media (max-width: 1000px) { .row, .row-3 { grid-template-columns: 1fr; } }

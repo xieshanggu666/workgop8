@@ -27,6 +27,10 @@ export const useParkStore = defineStore('park', {
     visitors: s => s.data?.visitors || [],
     loans: s => s.data?.loans || [],
     debt: s => s.data?.debt || { remainPrincipal: 0, arrears: 0, overdueCount: 0 },
+    complaints: s => s.data?.complaints || [],
+    complaintStats: s => s.data?.complaintStats || { open: 0, overdue: 0, todayClosed: 0, resolved: 0, total: 0, avgRating: 0, compTotal: 0 },
+    wordOfMouth: s => s.data?.wordOfMouth ?? 0,
+    openComplaints: s => (s.data?.complaints || []).filter(c => ['open', 'processing', 'ready'].includes(c.status)),
     activeEvents: s => (s.data?.events || []).filter(e => e.status === 'active')
   },
   actions: {
@@ -54,6 +58,12 @@ export const useParkStore = defineStore('park', {
     takeLoan(amount, periods, ratePct) { return this.api('POST', '/loan', { amount, periods, ratePct }) },
     repayLoan(id) { return this.api('POST', `/loans/${id}/repay`, {}) },
     planEvent(payload) { return this.api('POST', '/events', payload) },
-    resolveEvent(id) { return this.api('POST', `/events/${id}/resolve`, {}) }
+    resolveEvent(id) { return this.api('POST', `/events/${id}/resolve`, {}) },
+    fileComplaint(payload) { return this.api('POST', '/complaints', payload) },
+    assignComplaint(id, staff_id) { return this.api('POST', `/complaints/${id}/assign`, { staff_id }) },
+    escalateComplaint(id) { return this.api('POST', `/complaints/${id}/escalate`, {}) },
+    resolveComplaint(id, compensation) { return this.api('POST', `/complaints/${id}/resolve`, { compensation }) },
+    closeComplaint(id) { return this.api('POST', `/complaints/${id}/close`, {}) },
+    async complaintDetail(id) { return j('GET', `/complaints/${id}`) }
   }
 })

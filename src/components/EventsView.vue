@@ -13,7 +13,7 @@ const types = [
 ]
 const typeMeta = t => types.find(x => x.k === t)
 
-const evIcon = t => ({ '烟火':'🎆','花车巡游':'🎉','怀旧折扣日':'🏷️','音乐节':'🎤','weather':'🌧️','crowd':'👥','fault':'⚠️','celebrity':'🌟','protest':'📣','fever':'🔥' }[t] || '📌')
+const evIcon = t => ({ '烟火':'🎆','花车巡游':'🎉','怀旧折扣日':'🏷️','音乐节':'🎤','weather':'🌧️','crowd':'👥','fault':'⚠️','celebrity':'🌟','protest':'📣','fever':'🔥','overdue':'🏦','complaint':'📮' }[t] || '📌')
 
 function submit() {
   const m = typeMeta(activity.value.type)

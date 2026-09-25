@@ -119,10 +119,50 @@ CREATE TABLE IF NOT EXISTS events (
   feedback TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS complaints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',             -- 投诉单号 TS0001
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  category TEXT NOT NULL,                    -- queue/hygiene/facility/safety/food/service/pricing/missing
+  severity INTEGER NOT NULL DEFAULT 1,       -- 1 一般 / 2 严重 / 3 紧急
+  title TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  target_type TEXT NOT NULL DEFAULT '',      -- ride/vendor/zone
+  target_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'open',       -- open/processing/ready/closed_resolved/closed_force/closed_timeout
+  assignee_id INTEGER,                       -- 受理员工
+  progress REAL NOT NULL DEFAULT 0,          -- 处置进度 0-100
+  deadline_tick INTEGER NOT NULL,            -- 限时处置截止时刻(tick=游戏小时)
+  escalated INTEGER NOT NULL DEFAULT 0,      -- 是否经历过升级
+  escalations INTEGER NOT NULL DEFAULT 0,
+  compensation TEXT NOT NULL DEFAULT '',     -- apology/ticket/fastpass/voucher/cash
+  comp_cost INTEGER NOT NULL DEFAULT 0,
+  rating INTEGER NOT NULL DEFAULT 0,         -- 游客结案评价 1-5
+  close_reason TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'guest',      -- guest 游客自发 / manual 前台登记
+  resolved_tick INTEGER NOT NULL DEFAULT 0,  -- 现场处置完成(待确认补偿)时刻
+  closed_tick INTEGER NOT NULL DEFAULT 0,
+  closed_day INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS complaint_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  complaint_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,                      -- submit/assign/ready/resolve/escalate/auto_escalate/unassign/force/timeout
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status);
+CREATE INDEX IF NOT EXISTS idx_complaint_logs_cid ON complaint_logs(complaint_id);
 `)
 
 const now = () => new Date().toISOString()
@@ -148,6 +188,7 @@ function seed() {
   setSetting('reputation', 70)
   setSetting('cash', 200000)
   setSetting('guestBase', 600)
+  setSetting('wordOfMouth', 0)   // 投诉补救口碑 -10 ~ +10，回流影响客流与满意度
 
   const iz = db.prepare('INSERT INTO zones(name,theme,unlocked,capacity,cleanliness,scenery,pos_row,pos_col) VALUES(?,?,?,?,?,?,?,?)')
   const zones = [
